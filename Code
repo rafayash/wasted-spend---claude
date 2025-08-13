@@ -1,1 +1,481 @@
+import React, { useState, useCallback } from 'react';
+import { Upload, FileText, TrendingDown, AlertCircle, CheckCircle, ChevronUp, ChevronDown } from 'lucide-react';
+import * as XLSX from 'xlsx';
 
+const WastedSpendAnalyzer = () => {
+  const [file, setFile] = useState(null);
+  const [analysisResults, setAnalysisResults] = useState(null);
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState(null);
+  const [sortConfig, setSortConfig] = useState({ key: 'spend', direction: 'desc' });
+
+  const parseCSV = (csvText) => {
+    const lines = csvText.trim().split('\n');
+    const headers = lines[0].split(',').map(h => h.trim().replace(/"/g, ''));
+    const data = [];
+    
+    for (let i = 1; i < lines.length; i++) {
+      const values = lines[i].split(',').map(v => v.trim().replace(/"/g, ''));
+      const row = {};
+      headers.forEach((header, index) => {
+        row[header] = values[index] || '';
+      });
+      data.push(row);
+    }
+    
+    return data;
+  };
+
+  const parseExcel = async (file) => {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        try {
+          const data = new Uint8Array(e.target.result);
+          const workbook = XLSX.read(data, { type: 'array' });
+          const firstSheetName = workbook.SheetNames[0];
+          const worksheet = workbook.Sheets[firstSheetName];
+          const jsonData = XLSX.utils.sheet_to_json(worksheet);
+          resolve(jsonData);
+        } catch (error) {
+          reject(error);
+        }
+      };
+      reader.onerror = () => reject(new Error('Failed to read Excel file'));
+      reader.readAsArrayBuffer(file);
+    });
+  };
+
+  const analyzeData = (data) => {
+    // Group data by campaign
+    const campaignGroups = {};
+    
+    data.forEach(row => {
+      const campaignName = row['Campaign Name'] || '';
+      if (!campaignName) return;
+      
+      if (!campaignGroups[campaignName]) {
+        campaignGroups[campaignName] = [];
+      }
+      campaignGroups[campaignName].push(row);
+    });
+
+    // First pass: Calculate totals for each campaign
+    const campaignResults = Object.keys(campaignGroups).map(campaignName => {
+      const rows = campaignGroups[campaignName];
+      
+      let totalImpressions = 0;
+      let totalClicks = 0;
+      let totalSpend = 0;
+      let totalOrders = 0;
+      let totalSales = 0;
+      let wastedSpend = 0;
+      
+      console.log('Sample row data:', rows[0]); // Debug log
+      
+      rows.forEach(row => {
+        // Use exact column names from Amazon search term report
+        const impressions = parseFloat(row['Impressions'] || 0);
+        const clicks = parseFloat(row['Clicks'] || 0);
+        const spend = parseFloat(row['Spend'] || 0);
+        const orders = parseFloat(row['7 Day Total Orders (#)'] || 0);
+        const sales = parseFloat(row['7 Day Total Sales '] || row['7 Day Total Sales'] || 0); // Note the trailing space
+        
+        console.log('Row data:', { impressions, clicks, spend, orders, sales }); // Debug log
+        
+        totalImpressions += impressions;
+        totalClicks += clicks;
+        totalSpend += spend;
+        totalOrders += orders;
+        totalSales += sales; // Always add sales regardless of orders
+        
+        // Wasted spend: spend where orders = 0 (only this follows zero-orders logic)
+        if (orders === 0) {
+          wastedSpend += spend;
+        }
+      });
+      
+      console.log('Campaign totals:', { campaignName, totalSales, totalSpend, totalOrders }); // Debug log
+      
+      // Calculate derived metrics using your exact formulas
+      const ctr = totalImpressions > 0 ? (totalClicks / totalImpressions) * 100 : 0;
+      const cpc = totalClicks > 0 ? totalSpend / totalClicks : 0;
+      const acos = totalSales > 0 ? (totalSpend / totalSales) * 100 : 0; // ACOS = Spend/Sales * 100
+      const roas = totalSpend > 0 ? totalSales / totalSpend : 0; // ROAS = Sales/Spend
+      const cvr = totalClicks > 0 ? (totalOrders / totalClicks) * 100 : 0;
+      
+      return {
+        campaignName,
+        impressions: totalImpressions,
+        clicks: totalClicks,
+        ctr,
+        spend: totalSpend,
+        cpc,
+        orders: totalOrders,
+        sales: totalSales,
+        acos,
+        roas,
+        cvr,
+        wastedSpend
+      };
+    });
+    
+    // Calculate grand total spend across all campaigns
+    const grandTotalSpend = campaignResults.reduce((sum, campaign) => sum + campaign.spend, 0);
+    
+    // Second pass: Calculate wasted spend percentage based on grand total
+    const resultsWithWastedPercent = campaignResults.map(campaign => ({
+      ...campaign,
+      wastedSpendPercent: grandTotalSpend > 0 ? (campaign.wastedSpend / grandTotalSpend) * 100 : 0
+    }));
+    
+    return {
+      campaigns: resultsWithWastedPercent.sort((a, b) => b.spend - a.spend), // Sort by highest spend first
+      grandTotalSpend
+    };
+  };
+
+  const handleFileUpload = useCallback(async (uploadedFile) => {
+    if (!uploadedFile) return;
+    
+    setIsLoading(true);
+    setError(null);
+    
+    try {
+      let data;
+      
+      // Check file type and parse accordingly
+      if (uploadedFile.type === 'text/csv' || uploadedFile.name.endsWith('.csv')) {
+        const text = await uploadedFile.text();
+        data = parseCSV(text);
+      } else if (uploadedFile.type.includes('spreadsheetml') || uploadedFile.name.endsWith('.xlsx') || uploadedFile.name.endsWith('.xls')) {
+        data = await parseExcel(uploadedFile);
+      } else {
+        throw new Error('Please upload a CSV or Excel file (.csv, .xlsx, .xls)');
+      }
+      
+      if (data.length === 0) {
+        throw new Error('No data found in the uploaded file');
+      }
+      
+      const results = analyzeData(data);
+      setAnalysisResults(results);
+    } catch (err) {
+      setError(`Error processing file: ${err.message}`);
+    } finally {
+      setIsLoading(false);
+    }
+  }, []);
+
+  const handleDrop = useCallback((e) => {
+    e.preventDefault();
+    const droppedFile = e.dataTransfer.files[0];
+    if (droppedFile && (
+      droppedFile.type === 'text/csv' || 
+      droppedFile.type.includes('spreadsheetml') ||
+      droppedFile.name.endsWith('.csv') ||
+      droppedFile.name.endsWith('.xlsx') ||
+      droppedFile.name.endsWith('.xls')
+    )) {
+      setFile(droppedFile);
+      handleFileUpload(droppedFile);
+    } else {
+      setError('Please upload a CSV or Excel file (.csv, .xlsx, .xls)');
+    }
+  }, [handleFileUpload]);
+
+  const handleFileSelect = (e) => {
+    const selectedFile = e.target.files[0];
+    if (selectedFile) {
+      setFile(selectedFile);
+      handleFileUpload(selectedFile);
+    }
+  };
+
+  const handleSort = (key) => {
+    let direction = 'desc';
+    if (sortConfig.key === key && sortConfig.direction === 'desc') {
+      direction = 'asc';
+    }
+    setSortConfig({ key, direction });
+  };
+
+  const getSortedCampaigns = () => {
+    if (!analysisResults) return [];
+    
+    const sortedCampaigns = [...analysisResults.campaigns].sort((a, b) => {
+      const aValue = a[sortConfig.key];
+      const bValue = b[sortConfig.key];
+      
+      // Handle string sorting (campaign names)
+      if (typeof aValue === 'string') {
+        return sortConfig.direction === 'asc' 
+          ? aValue.localeCompare(bValue)
+          : bValue.localeCompare(aValue);
+      }
+      
+      // Handle numeric sorting
+      if (sortConfig.direction === 'asc') {
+        return aValue - bValue;
+      } else {
+        return bValue - aValue;
+      }
+    });
+    
+    return sortedCampaigns;
+  };
+
+  const SortableHeader = ({ children, sortKey, className = "" }) => (
+    <th 
+      className={`px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider cursor-pointer hover:bg-gray-100 select-none ${className}`}
+      onClick={() => handleSort(sortKey)}
+    >
+      <div className="flex items-center space-x-1">
+        <span>{children}</span>
+        {sortConfig.key === sortKey && (
+          sortConfig.direction === 'desc' 
+            ? <ChevronDown className="h-3 w-3" />
+            : <ChevronUp className="h-3 w-3" />
+        )}
+      </div>
+    </th>
+  );
+
+  const formatCurrency = (value) => `$${value.toFixed(2)}`;
+  const formatPercent = (value) => `${value.toFixed(2)}%`;
+  const formatNumber = (value) => value.toLocaleString();
+
+  const sortedCampaigns = getSortedCampaigns();
+  const totalWastedSpend = analysisResults ? 
+    analysisResults.campaigns.reduce((sum, campaign) => sum + campaign.wastedSpend, 0) : 0;
+  const totalWastedSpendPercent = analysisResults && analysisResults.grandTotalSpend > 0 ? 
+    (totalWastedSpend / analysisResults.grandTotalSpend) * 100 : 0;
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-slate-50 to-blue-50">
+      {/* Header */}
+      <header className="bg-white border-b border-gray-200 shadow-sm">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4">
+          <div className="flex items-center">
+            <TrendingDown className="h-8 w-8 text-blue-600 mr-3" />
+            <h1 className="text-2xl font-bold text-gray-900">Amazon Wasted Spend Analyzer</h1>
+          </div>
+        </div>
+      </header>
+
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+        {/* About Section */}
+        <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-8 mb-8">
+          <div className="flex items-center mb-6">
+            <AlertCircle className="h-6 w-6 text-blue-600 mr-3" />
+            <h2 className="text-2xl font-semibold text-gray-900">About Wasted Spend Analysis</h2>
+          </div>
+          
+          <div className="grid md:grid-cols-2 gap-8">
+            <div>
+              <h3 className="text-lg font-medium text-gray-900 mb-3">What is Wasted Spend?</h3>
+              <p className="text-gray-600 mb-4">
+                Wasted spend in Amazon advertising refers to money spent on clicks that don't result in any orders. 
+                These are clicks that generate cost but provide no return on investment.
+              </p>
+              
+              <h3 className="text-lg font-medium text-gray-900 mb-3">How We Calculate It</h3>
+              <p className="text-gray-600">
+                We analyze your Sponsored Product Search Term Report to identify campaigns where spend occurred 
+                but resulted in zero orders. This gives you a clear view of where your budget is being wasted.
+              </p>
+            </div>
+            
+            <div className="bg-blue-50 rounded-lg p-6">
+              <h3 className="text-lg font-medium text-blue-900 mb-3">Analysis Includes:</h3>
+              <ul className="text-blue-800 space-y-2">
+                <li className="flex items-start">
+                  <CheckCircle className="h-4 w-4 mt-0.5 mr-2 flex-shrink-0" />
+                  Campaign-level performance metrics
+                </li>
+                <li className="flex items-start">
+                  <CheckCircle className="h-4 w-4 mt-0.5 mr-2 flex-shrink-0" />
+                  Wasted spend identification
+                </li>
+                <li className="flex items-start">
+                  <CheckCircle className="h-4 w-4 mt-0.5 mr-2 flex-shrink-0" />
+                  Percentage of budget wasted
+                </li>
+                <li className="flex items-start">
+                  <CheckCircle className="h-4 w-4 mt-0.5 mr-2 flex-shrink-0" />
+                  CTR, CPC, ACOS, ROAS, and CVR calculations
+                </li>
+              </ul>
+            </div>
+          </div>
+        </div>
+
+        {/* Upload Section */}
+        <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-8 mb-8">
+          <div className="flex items-center mb-6">
+            <Upload className="h-6 w-6 text-blue-600 mr-3" />
+            <h2 className="text-2xl font-semibold text-gray-900">Upload Search Term Report</h2>
+          </div>
+          
+          <div 
+            className="border-2 border-dashed border-gray-300 rounded-lg p-8 text-center hover:border-blue-400 transition-colors cursor-pointer"
+            onDrop={handleDrop}
+            onDragOver={(e) => e.preventDefault()}
+            onClick={() => document.getElementById('file-input').click()}
+          >
+            <FileText className="mx-auto h-12 w-12 text-gray-400 mb-4" />
+            <p className="text-xl text-gray-600 mb-2">
+              Drop your Sponsored Product Search Term Report here
+            </p>
+            <p className="text-sm text-gray-500 mb-4">
+              Or click to select a file (CSV, Excel .xlsx, .xls)
+            </p>
+            <input
+              id="file-input"
+              type="file"
+              accept=".csv,.xlsx,.xls"
+              onChange={handleFileSelect}
+              className="hidden"
+            />
+            {file && (
+              <p className="text-sm text-green-600 mt-2">
+                Selected: {file.name}
+              </p>
+            )}
+          </div>
+          
+          {error && (
+            <div className="mt-4 p-4 bg-red-50 border border-red-200 rounded-lg">
+              <p className="text-red-600">{error}</p>
+            </div>
+          )}
+          
+          {isLoading && (
+            <div className="mt-4 text-center">
+              <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600 mx-auto"></div>
+              <p className="mt-2 text-gray-600">Analyzing your data...</p>
+            </div>
+          )}
+        </div>
+
+        {/* Results Section */}
+        {analysisResults && (
+          <div className="bg-white rounded-lg shadow-sm border border-gray-200">
+            <div className="p-6 border-b border-gray-200">
+              <h2 className="text-2xl font-semibold text-gray-900 mb-4">Campaign Analysis Results</h2>
+              <div className="grid md:grid-cols-3 gap-4">
+                <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
+                  <p className="text-blue-800 text-lg font-medium">
+                    Total Spend: <span className="text-blue-900 font-bold">{formatCurrency(analysisResults.grandTotalSpend)}</span>
+                  </p>
+                </div>
+                <div className="bg-red-50 border border-red-200 rounded-lg p-4">
+                  <p className="text-red-800 text-lg font-medium">
+                    Total Wasted Spend: <span className="text-red-900 font-bold">{formatCurrency(totalWastedSpend)}</span>
+                  </p>
+                </div>
+                <div className="bg-red-50 border border-red-200 rounded-lg p-4">
+                  <p className="text-red-800 text-lg font-medium">
+                    Wasted Spend %: <span className="text-red-900 font-bold">{formatPercent(totalWastedSpendPercent)}</span>
+                  </p>
+                </div>
+              </div>
+            </div>
+            
+            <div className="overflow-x-auto">
+              <div className="mb-4 px-6 text-sm text-gray-600">
+                <p>💡 <strong>Tip:</strong> Click any column header to sort the data. Click again to reverse the sort order.</p>
+              </div>
+              <table className="min-w-full">
+                <thead className="bg-gray-50">
+                  <tr>
+                    <SortableHeader sortKey="campaignName">Campaign Name</SortableHeader>
+                    <SortableHeader sortKey="impressions">Impressions</SortableHeader>
+                    <SortableHeader sortKey="clicks">Clicks</SortableHeader>
+                    <SortableHeader sortKey="ctr">CTR</SortableHeader>
+                    <SortableHeader sortKey="spend">Spend</SortableHeader>
+                    <SortableHeader sortKey="cpc">CPC</SortableHeader>
+                    <SortableHeader sortKey="orders">Orders</SortableHeader>
+                    <SortableHeader sortKey="sales">Sales</SortableHeader>
+                    <SortableHeader sortKey="acos">ACOS</SortableHeader>
+                    <SortableHeader sortKey="roas">ROAS</SortableHeader>
+                    <SortableHeader sortKey="cvr">CVR</SortableHeader>
+                    <SortableHeader sortKey="wastedSpend" className="text-red-500">Wasted Spend</SortableHeader>
+                    <SortableHeader sortKey="wastedSpendPercent" className="text-red-500">Wasted %</SortableHeader>
+                  </tr>
+                </thead>
+                <tbody className="bg-white divide-y divide-gray-200">
+                  {sortedCampaigns.map((campaign, index) => (
+                    <tr key={index} className="hover:bg-gray-50">
+                      <td className="px-4 py-3 text-sm font-medium text-gray-900">{campaign.campaignName}</td>
+                      <td className="px-4 py-3 text-sm text-gray-700">{formatNumber(campaign.impressions)}</td>
+                      <td className="px-4 py-3 text-sm text-gray-700">{formatNumber(campaign.clicks)}</td>
+                      <td className="px-4 py-3 text-sm text-gray-700">{formatPercent(campaign.ctr)}</td>
+                      <td className="px-4 py-3 text-sm text-gray-700">{formatCurrency(campaign.spend)}</td>
+                      <td className="px-4 py-3 text-sm text-gray-700">{formatCurrency(campaign.cpc)}</td>
+                      <td className="px-4 py-3 text-sm text-gray-700">{formatNumber(campaign.orders)}</td>
+                      <td className="px-4 py-3 text-sm text-gray-700">{formatCurrency(campaign.sales)}</td>
+                      <td className="px-4 py-3 text-sm text-gray-700">{formatPercent(campaign.acos)}</td>
+                      <td className="px-4 py-3 text-sm text-gray-700">{campaign.roas.toFixed(2)}x</td>
+                      <td className="px-4 py-3 text-sm text-gray-700">{formatPercent(campaign.cvr)}</td>
+                      <td className="px-4 py-3 text-sm font-medium text-red-600">{formatCurrency(campaign.wastedSpend)}</td>
+                      <td className="px-4 py-3 text-sm font-medium text-red-600">{formatPercent(campaign.wastedSpendPercent)}</td>
+                    </tr>
+                  ))}
+                  
+                  {/* Totals Row */}
+                  <tr className="bg-gray-100 border-t-2 border-gray-300 font-semibold">
+                    <td className="px-4 py-3 text-sm font-bold text-gray-900">TOTAL</td>
+                    <td className="px-4 py-3 text-sm text-gray-700">{formatNumber(analysisResults.campaigns.reduce((sum, c) => sum + c.impressions, 0))}</td>
+                    <td className="px-4 py-3 text-sm text-gray-700">{formatNumber(analysisResults.campaigns.reduce((sum, c) => sum + c.clicks, 0))}</td>
+                    <td className="px-4 py-3 text-sm text-gray-700">
+                      {formatPercent(
+                        analysisResults.campaigns.reduce((sum, c) => sum + c.impressions, 0) > 0 
+                          ? (analysisResults.campaigns.reduce((sum, c) => sum + c.clicks, 0) / analysisResults.campaigns.reduce((sum, c) => sum + c.impressions, 0)) * 100 
+                          : 0
+                      )}
+                    </td>
+                    <td className="px-4 py-3 text-sm font-bold text-gray-900">{formatCurrency(analysisResults.grandTotalSpend)}</td>
+                    <td className="px-4 py-3 text-sm text-gray-700">
+                      {formatCurrency(
+                        analysisResults.campaigns.reduce((sum, c) => sum + c.clicks, 0) > 0 
+                          ? analysisResults.grandTotalSpend / analysisResults.campaigns.reduce((sum, c) => sum + c.clicks, 0)
+                          : 0
+                      )}
+                    </td>
+                    <td className="px-4 py-3 text-sm text-gray-700">{formatNumber(analysisResults.campaigns.reduce((sum, c) => sum + c.orders, 0))}</td>
+                    <td className="px-4 py-3 text-sm text-gray-700">{formatCurrency(analysisResults.campaigns.reduce((sum, c) => sum + c.sales, 0))}</td>
+                    <td className="px-4 py-3 text-sm text-gray-700">
+                      {formatPercent(
+                        analysisResults.campaigns.reduce((sum, c) => sum + c.sales, 0) > 0 
+                          ? (analysisResults.grandTotalSpend / analysisResults.campaigns.reduce((sum, c) => sum + c.sales, 0)) * 100 
+                          : 0
+                      )}
+                    </td>
+                    <td className="px-4 py-3 text-sm text-gray-700">
+                      {(analysisResults.grandTotalSpend > 0 
+                        ? (analysisResults.campaigns.reduce((sum, c) => sum + c.sales, 0) / analysisResults.grandTotalSpend)
+                        : 0
+                      ).toFixed(2)}x
+                    </td>
+                    <td className="px-4 py-3 text-sm text-gray-700">
+                      {formatPercent(
+                        analysisResults.campaigns.reduce((sum, c) => sum + c.clicks, 0) > 0 
+                          ? (analysisResults.campaigns.reduce((sum, c) => sum + c.orders, 0) / analysisResults.campaigns.reduce((sum, c) => sum + c.clicks, 0)) * 100 
+                          : 0
+                      )}
+                    </td>
+                    <td className="px-4 py-3 text-sm font-bold text-red-700">{formatCurrency(totalWastedSpend)}</td>
+                    <td className="px-4 py-3 text-sm font-bold text-red-700">{formatPercent(totalWastedSpendPercent)}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+export default WastedSpendAnalyzer;
